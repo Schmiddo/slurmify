@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+import os
+import shlex
+import sys
+import random
+from argparse import ArgumentParser
+from pathlib import Path
+
+from dataclasses import dataclass
+
+
+def hidashify(s):
+  return s.replace("_", "-")
+
+
+class SBATCHParams:
+    _OPTIONS = [
+        "account", "partition", "job-name", "output", "nodes", "cpus-per-task",
+        "tasks-per-node", "mem", "gres", "time", "signal", "constraint"
+    ]
+
+    def __init__(self, **options):
+        self.options = {hidashify(o): v for o, v in options.items()}
+
+    def update(self, **kwargs):
+        options = dict(**self.options)
+        options.update({hidashify(o): v for o, v in kwargs.items()})
+        return type(self)(**options)
+
+    def delete(self, key):
+        options = {k: v for k, v in self.options.items() if k != key}
+        return type(self)(**options)
+
+    def get_option_list(self):
+        sorted_options = (
+            [o for o in self._OPTIONS if o in self.options]
+            + list(self.options.keys() - set(self._OPTIONS))
+        )
+        options = [
+            f"--{o}={self.options[o]}"
+            for o in sorted_options
+        ]
+        return options
+
+    def get_preamble_lines(self):
+        options = ["#SBATCH " + o for o in self.get_option_list()]
+        return options
+
+    def get_preamble(self):
+        return "\n".join(self.get_preamble_lines())
+
+    def get_command_line(self):
+        cmd = "sbatch " + " ".join(self.get_option_list())
+        return cmd
+
+
+import yaml
+cluster_info = yaml.load(open("cvg_partitions.yaml"), yaml.SafeLoader)
+partitions = cluster_info["partitions"]
+
+
+DEFAULT_PARTITION = "lopri"
+DEFAULT_OUTPUT_DIR = Path(os.getenv("AUTOSLURM_OUTPUT_DIR", "autoslurm"))
+
+SBATCH_CMD = "sbatch"
+SCRIPT_PATH = "wrapper.sh"
+
+
+def get_default_time(partition):
+    time = (
+        partitions[partition].get("time")
+        or cluster_info["defaults"].get("time")
+    )
+    return time
+
+
+def get_default_cpus(partition, ngpus):
+    return (
+        partitions[partition].get("cpus_per_gpu")
+        or cluster_info["defaults"].get("cpus_per_gpu")
+        or 4
+    ) * ngpus
+
+
+def get_default_gpus(partition):
+    ngpus = (
+        partitions[partition].get("num_gpus")
+        or cluster_info["defaults"].get("num_gpus")
+        or 1
+    )
+    return ngpus
+
+
+def get_default_memory(partition, ngpus):
+    return (
+        partitions[partition].get("mem_per_gpu")
+        or cluster_info["defaults"].get("mem_per_gpu")
+    ) * ngpus
+
+
+def get_sbatch_params_from_args(args):
+    options = {
+        "partition": args.partition,
+        "nodes": args.nodes,
+        "job_name": args.jobname or "wrapper",
+        "output": args.output_dir / args.output,
+        "cpus_per_task": args.cpus,
+        "tasks-per-node": 1, 
+        "mem": args.mem,
+        "gres": f"gpu:{args.gpus}",
+        "time": args.time,
+        "signal": "SIGUSR1@90",
+    }
+    if args.account:
+        options["account"] = args.account
+    if args.nodelist:
+        options["nodelist"] = args.nodelist
+    if args.constraint:
+        options["constraint"] = args.constraint
+    if hasattr(args, "partition_list"):
+        options["partition"] = ",".join(args.partition_list)
+    return SBATCHParams(**options)
+
+
+def make_script(args, sbatch_params, cmd):
+    script = ["#!/bin/bash"]
+    script += sbatch_params.get_preamble_lines()
+    script.append("")
+    script.append("[[ -e env.sh ]] && . env.sh")
+    script.append("")
+    script.append(f"export OMP_NUM_THREADS={args.cpus//args.gpus}")
+    script.append(f"export NUMBA_NUM_THREADS={args.cpus//args.gpus}")
+    if args.nodes > 1:
+        # set env variables used by torchrun
+        # weird addressing scheme for juwels booster
+        address_suffix = "i" if "booster" in args.partition else ""
+        script.append(f'MASTER_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1){address_suffix}')
+        script.append('export PET_RDZV_BACKEND=c10d')
+        script.append('export PET_RDZV_ID=$SLURM_JOB_ID')
+        script.append('export PET_RDZV_ENDPOINT=$MASTER_NODE:12345')
+        script.append(f'export PET_NNODES={args.nodes}')
+    script.append(f'export PET_NPROC_PER_NODE={args.gpus}')
+    script.append("")
+    script += cmd
+    script.append("")
+    return "\n".join(script)
+
+
+def schedule_job(cmd, dependency, args):
+    if args.file:
+        with open(cmd, "r") as f:
+            # use rstrip to retain intendation
+            cmd = [l.rstrip() for l in f.readlines()]
+    else:
+        if False:
+            # fixme: was necessary for JSC
+            srun_extra_args = f"--cpus-per-task={args.cpus} --hint=nomultithread"
+        else:
+            srun_extra_args = ""
+        cmd = [f"srun {srun_extra_args}" + " ".join(shlex.quote(c) for c in cmd)]
+
+    sbatch_params = get_sbatch_params_from_args(args)
+    script = make_script(args, sbatch_params, cmd)
+
+    if dependency:
+        dependency = f"--dependency={dependency}"
+    else:
+        dependency = ""
+
+    with open(SCRIPT_PATH, "w") as f:
+        f.write(script)
+    sbatch_cmd_line = f"{args.env} {SBATCH_CMD} --parsable {dependency} --export=ALL {SCRIPT_PATH}"
+    if args.dryrun:
+        print(sbatch_cmd_line)
+        print(script)
+        return str(random.randint(100000, 999999))
+    else:
+        jobid = os.popen(sbatch_cmd_line).read().strip()
+        print(jobid)
+        return jobid
+
+
+def main():
+    def abspath(p):
+        return Path(p).absolute()
+
+    parser = ArgumentParser()
+    parser.add_argument("partition", default=DEFAULT_PARTITION)#, choices=PARTITIONS)
+    parser.add_argument("--nodes", type=int, default=1)
+    parser.add_argument("--nodelist", default=None)
+    parser.add_argument("--jobname", default=None)
+    parser.add_argument("--account", default=os.getenv("SLURM_ACCOUNT", None))
+    parser.add_argument("--gpus", type=int, default=None)
+    parser.add_argument("--cpus", type=int, default=None)
+    parser.add_argument("--mem", default=None)
+    parser.add_argument("--time", default=None)
+    parser.add_argument("--dependency", default=None)
+    parser.add_argument("--dependency_file", default=None, type=Path)
+    parser.add_argument("--constraint", default=None)
+    parser.add_argument("--env", default="")
+    parser.add_argument("--output", default="%j.out")
+    parser.add_argument("--output_dir", type=abspath, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--file", "-f", default=None)
+    parser.add_argument("--dryrun", action="store_true")
+
+    args, cmd = parser.parse_known_args()
+
+    if cmd and args.file:
+        raise ValueError(f"Specify either a script or a command to run, but not both")
+    if not cmd and not args.file:
+        raise ValueError(f"Must specify either a script or a command to run")
+
+    if not args.output_dir.exists():
+        args.output_dir.mkdir(parents=True)
+
+    if "," in args.partition:
+        args.partition_list = args.partition.split(",")
+        args.partition = args.partition_list[0]
+
+    if args.gpus is None:
+        args.gpus = get_default_gpus(args.partition)
+    if args.cpus is None:
+        args.cpus = get_default_cpus(args.partition, args.gpus)
+    if args.mem is None:
+        args.mem = get_default_memory(args.partition, args.gpus)
+    if args.time is None:
+        args.time = get_default_time(args.partition)
+
+    if args.file == "-" or cmd[0] == "-":
+        cmds = [shlex.split(l.strip()) for l in sys.stdin.readlines()]
+    else:
+        cmds = [cmd or args.file]
+
+    @dataclass
+    class Node:
+        id: int
+        cmd: str
+        deps: list["Node"]
+        jobid: int | None = None
+        fixed_dependency: str | None = None
+
+        def collect(self, graph: list["Node"]):
+            if self.deps:
+                return "afterok:" + ",".join([graph[n].jobid for n in self.deps])
+            else:
+                return ""
+
+    if args.dependency_file is not None:
+        dependencies = args.dependency_file.open().readlines()
+        if len(dependencies) != len(cmds):
+                raise ValueError("Number of jobs and number of dependencies does not match")
+
+        dependency_graph = [Node(i, cmd, [int(v) for v in l.split() if v != "-"]) for i, (l, cmd) in enumerate(zip(dependencies, cmds))]
+        if dependency_graph[0].deps:
+            raise ValueError("The first job might not depend on anything")
+        for n in dependency_graph:
+            for c in n.deps:
+                if c >= n.id:
+                    raise ValueError(f"Dependency graph is not valid: line {n.id} refers to line {c}")
+    else:
+        # use the same dependency for all jobs
+        dependency_graph = [Node(i, cmd, [], fixed_dependency=args.dependency) for i, cmd in enumerate(cmds)]
+
+    for node in dependency_graph:
+        dependency_string = node.collect(dependency_graph)
+        node.jobid = schedule_job(node.cmd, dependency_string, args)
+
+
+if __name__ == "__main__":
+    main()
